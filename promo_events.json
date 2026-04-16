@@ -1,0 +1,69 @@
+{
+  "events": [
+    {
+      "id": "2026042-046_changsha_promo",
+      "name": "为爱奔跑·双色球幸运加速",
+      "type": "compound_bonus",
+      "active": true,
+      "start_date": "2026-04-14",
+      "end_date": "2026-04-26",
+      "draw_range": {
+        "start": "2026042",
+        "end": "2026046",
+        "total_draws": 5
+      },
+      "region": "长沙",
+      "rules": {
+        "bet_type": "compound",
+        "red_range": [8, 10],
+        "blue_min": 1,
+        "min_prize": 1000,
+        "bonus_type": "equal_amount",
+        "bonus_cap": 10000,
+        "per_draw_cap": 240000,
+        "bonus_claim_deadline": "2026-04-30T20:00:00"
+      },
+      "compound_tiers": [
+        {
+          "red_count": 8,
+          "blue_count": 1,
+          "cost": 56,
+          "prize_for_1_blue": 140,
+          "max_bonus": 10000
+        },
+        {
+          "red_count": 9,
+          "blue_count": 1,
+          "cost": 168,
+          "prize_for_1_blue": 420,
+          "max_bonus": 10000
+        },
+        {
+          "red_count": 10,
+          "blue_count": 1,
+          "cost": 420,
+          "prize_for_1_blue": 1050,
+          "max_bonus": 10000
+        }
+      ],
+      "additional_benefits": [
+        {
+          "name": "买茶湘赢赠票",
+          "period": "2026-04-20 to 2026-05-10",
+          "prize": "300000"
+        },
+        {
+          "name": "1238 哆来咪发",
+          "dates": [1, 2, 3, 8],
+          "note": "每月 1、2、3、8 日福粉日超多福利"
+        },
+        {
+          "name": "福彩杯乐在望城路跑赛",
+          "date": "2026-04-19",
+          "location": "望城"
+        }
+      ],
+      "website": "https://www.csfczx.cn"
+    }
+  ]
+}

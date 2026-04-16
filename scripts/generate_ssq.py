@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / 'config.json'
 DATA_PATH = ROOT / 'data' / 'ssq_history.csv'
 OUTPUT_DIR = ROOT / 'outputs'
+PROMO_PATH = ROOT / 'promo_events.json'
 
 
 def load_config():
@@ -379,22 +380,175 @@ def fmt_pick_v2(p):
             f"和值：{p['sum']} | 极距：{p['span']} | AC：{p['ac']}")
 
 
+def load_promo_events():
+    """加载促销活动"""
+    if not PROMO_PATH.exists():
+        return []
+    with open(PROMO_PATH, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data.get('events', [])
+
+
+def get_active_promo(draw_date=None):
+    """获取当前有效的促销活动"""
+    events = load_promo_events()
+    today = datetime.now().strftime('%Y-%m-%d')
+    if draw_date is None:
+        draw_date = today
+    
+    for event in events:
+        if not event.get('active', False):
+            continue
+        if event['start_date'] <= draw_date <= event['end_date']:
+            return event
+    return None
+
+
+def generate_compound_bet(red_count, blue_count=1):
+    """生成复式投注号码"""
+    reds = sorted(random.sample(range(1, 34), red_count))
+    blues = [random.randint(1, 16)] if blue_count == 1 else sorted(random.sample(range(1, 17), blue_count))
+    return reds, blues
+
+
+def calc_compound_cost(red_count, blue_count):
+    """计算复式投注金额"""
+    from math import comb
+    red_combos = comb(red_count, 6)
+    blue_combos = comb(blue_count, 1)
+    return red_combos * blue_combos * 2
+
+
+def generate_promo_picks(config, history, promo):
+    """生成活动推荐的复式投注号码"""
+    candidates = generate_candidates_v2(config, history)
+    
+    # 从高分候选中提取红球池
+    top_reds = []
+    for c in candidates[:50]:
+        top_reds.extend(c['reds'])
+    
+    red_freq = Counter(top_reds)
+    preferred_reds = [n for n, _ in red_freq.most_common(15)]
+    
+    # 生成 8+1, 9+1, 10+1 复式
+    compound_picks = []
+    
+    for tier in promo['compound_tiers']:
+        red_count = tier['red_count']
+        blue_count = 1
+        
+        # 从优选红球中选择
+        base_reds = random.sample(preferred_reds, min(red_count, len(preferred_reds)))
+        
+        # 如果不够，从高分候选补充
+        if len(base_reds) < red_count:
+            all_reds = list(range(1, 34))
+            remaining = [n for n in all_reds if n not in base_reds]
+            base_reds.extend(random.sample(remaining, red_count - len(base_reds)))
+        
+        # 选择蓝球（偏好热号）
+        hot_blues, warm_blues, cold_blues, blue_freq = hot_warm_cold_dynamic(history, 16, config, blue=True)
+        if hot_blues:
+            blue = random.choice(list(hot_blues))
+        else:
+            blue = random.randint(1, 16)
+        
+        reds = sorted(base_reds)
+        cost = calc_compound_cost(red_count, blue_count)
+        
+        compound_picks.append({
+            'type': f'{red_count}+{blue_count}',
+            'reds': reds,
+            'blues': [blue],
+            'cost': cost,
+            'tier': tier,
+            'expected_bonus': tier['max_bonus'] if cost >= 56 else 0
+        })
+    
+    return compound_picks
+
+
+def save_promo_output(promo_picks, promo, config):
+    """保存活动选号结果"""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+    
+    out = {
+        'generated_at': datetime.now().isoformat(timespec='seconds'),
+        'promo_event': promo['name'],
+        'promo_period': f"{promo['draw_range']['start']}-{promo['draw_range']['end']}",
+        'picks': promo_picks,
+        'rules': {
+            'min_prize_for_bonus': promo['rules']['min_prize'],
+            'bonus_cap': promo['rules']['bonus_cap'],
+            'claim_deadline': promo['rules']['bonus_claim_deadline']
+        }
+    }
+    
+    path = OUTPUT_DIR / f'ssq-promo-{ts}.json'
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    return path, out
+
+
+def fmt_promo_pick(p):
+    reds = ' '.join(f'{n:02d}' for n in p['reds'])
+    blues = ' '.join(f'{b:02d}' for b in p['blues'])
+    return (f"{p['type']}复式 | 红球：{reds} | 蓝球：{blues} | "
+            f"金额：¥{p['cost']} | 最高赠票：¥{p['tier']['max_bonus']}")
+
+
 def main():
+    import sys
+    
     config = load_config()
     history = load_history()
-    candidates = generate_candidates_v2(config, history)
-    path, out = save_output(candidates, config)
+    
+    # 检查是否有活动参数
+    if len(sys.argv) > 1 and sys.argv[1] == '--promo':
+        # 活动选号模式
+        promo = get_active_promo()
+        if not promo:
+            print('❌ 当前没有有效的促销活动')
+            return
+        
+        print(f'🎁 活动选号模式：{promo["name"]}')
+        print(f'活动期间：{promo["start_date"]} 至 {promo["end_date"]}')
+        print(f'适用期数：{promo["draw_range"]["start"]}-{promo["draw_range"]["end"]} ({promo["draw_range"]["total_draws"]}期)')
+        print(f'规则：单票中奖超¥{promo["rules"]["min_prize"]} 赠等额赠票（最高¥{promo["rules"]["bonus_cap"]}）')
+        print()
+        
+        promo_picks = generate_promo_picks(config, history, promo)
+        path, out = save_promo_output(promo_picks, promo, config)
+        
+        print('📋 活动推荐复式投注:')
+        for p in promo_picks:
+            print('-', fmt_promo_pick(p))
+        print(f'\n输出文件：{path}')
+        print(f'\n⚠️ 赠票领取截止：{promo["rules"]["bonus_claim_deadline"]}')
+        print(f'ℹ️ 详情：{promo.get("website", "请咨询当地福彩网点")}')
+    else:
+        # 普通选号模式
+        candidates = generate_candidates_v2(config, history)
+        path, out = save_output(candidates, config)
 
-    print('双色球选号完成 (v2)')
-    print(f'策略：{config["generation"].get("default_strategy", "balanced")}')
-    print(f'候选池：{config["generation"]["candidate_pool_size"]} 注')
-    print(f'输出文件：{path}')
-    print('\n主推:')
-    for p in out['main']:
-        print('-', fmt_pick_v2(p))
-    print('\n备选:')
-    for p in out['backup']:
-        print('-', fmt_pick_v2(p))
+        print('双色球选号完成 (v2)')
+        print(f'策略：{config["generation"].get("default_strategy", "balanced")}')
+        print(f'候选池：{config["generation"]["candidate_pool_size"]} 注')
+        print(f'输出文件：{path}')
+        print('\n主推:')
+        for p in out['main']:
+            print('-', fmt_pick_v2(p))
+        print('\n备选:')
+        for p in out['backup']:
+            print('-', fmt_pick_v2(p))
+        
+        # 检查是否有活动
+        promo = get_active_promo()
+        if promo:
+            print(f'\n🎁 当前有活动：{promo["name"]}')
+            print(f'   运行：python3 generate_ssq.py --promo 生成活动推荐复式')
 
 
 if __name__ == '__main__':
