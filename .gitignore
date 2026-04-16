@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Outputs (generated, keep structure only)
+outputs/*.json
+outputs/*.md
+
+# Data (auto-updated, can be regenerated)
+data/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
