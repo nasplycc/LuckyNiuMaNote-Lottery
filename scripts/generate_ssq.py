@@ -301,11 +301,17 @@ def score_candidate_v2(reds, blue, history, config, red_meta, blue_meta, trends)
     if blue_odd == 1:
         score *= 1.01
 
+    # === 2026-05-14 升级: 增加随机噪声 ===
+    # 双色球是独立随机事件，历史频率无预测力
+    # 在最终评分中加入±8%随机噪声，打破频率偏差
+    random_factor = random.uniform(0.92, 1.08)
+    score *= random_factor
+
     return round(score, 4)
 
 
 def generate_candidates_v2(config, history):
-    """v2 生成：扩大候选池，加入形态筛选"""
+    """v2 生成：扩大候选池，加入形态筛选 + 随机混合（2026-05-14升级）"""
     red_omit = omission_map(history, 33)
     blue_omit = omission_map(history, 16)
     hot_reds, warm_reds, cold_reds, red_freq = hot_warm_cold_dynamic(history, 33, config, blue=False)
@@ -323,7 +329,13 @@ def generate_candidates_v2(config, history):
     span_min = config['generation'].get('span_min', 18)
     span_max = config['generation'].get('span_max', 30)
 
-    while len(candidates) < pool_size:
+    # 2026-05-14: 候选池分两部分：60%频率引导 + 40%纯随机
+    # 双色球是独立随机事件，纯随机反而更接近真实分布
+    scored_count = int(pool_size * 0.6)
+    random_count = pool_size - scored_count
+
+    # === 第一部分：频率引导 + 形态筛选 + 随机噪声 ===
+    while len(candidates) < scored_count:
         reds = tuple(sorted(random.sample(range(1, 34), 6)))
         blue = random.randint(1, 16)
         key = (reds, blue)
@@ -331,7 +343,6 @@ def generate_candidates_v2(config, history):
             continue
         seen.add(key)
 
-        # 预筛选：形态阈值
         span = calc_span(list(reds))
         ac = calc_ac_value(list(reds))
         if not (span_min <= span <= span_max):
@@ -353,19 +364,126 @@ def generate_candidates_v2(config, history):
             'tail_sum': calc_tail_sum(list(reds)),
         })
 
+    # === 第二部分：纯随机 + 形态筛选（无频率偏差） ===
+    while len(candidates) < pool_size:
+        reds = tuple(sorted(random.sample(range(1, 34), 6)))
+        blue = random.randint(1, 16)
+        key = (reds, blue)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        span = calc_span(list(reds))
+        ac = calc_ac_value(list(reds))
+        if not (span_min <= span <= span_max):
+            continue
+        if not (ac_min <= ac <= ac_max):
+            continue
+
+        # 纯随机，仅保留形态约束
+        score = 100.0 * random.uniform(0.90, 1.10)  # 随机分数
+        candidates.append({
+            'reds': list(reds),
+            'blue': blue,
+            'score': score,
+            'odd_even': odd_even_split(list(reds)),
+            'zone_split': zone_split(list(reds)),
+            'sum': sum(reds),
+            'consecutive_groups': consecutive_groups(list(reds)),
+            'span': span,
+            'ac': ac,
+            'tail_sum': calc_tail_sum(list(reds)),
+        })
+
     candidates.sort(key=lambda x: x['score'], reverse=True)
-    return candidates
+    return candidates, red_meta, blue_meta, trends
 
 
-def save_output(candidates, config):
+def save_output(candidates, config, history=None, red_meta=None, blue_meta=None, trends=None):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+
+    # === 蓝球差异化覆盖 — 从高分候选池中选蓝球尽量不重复的5注 ===
+    main_count = config['generation']['output_main']
+    backup_count = config['generation']['output_backup']
+    total_output = main_count + backup_count
+
+    selected = []
+    used_blues = set()
+
+    for c in candidates:
+        if len(selected) >= total_output:
+            break
+        if c['blue'] not in used_blues:
+            selected.append(c)
+            used_blues.add(c['blue'])
+
+    if len(selected) < total_output:
+        for c in candidates:
+            if len(selected) >= total_output:
+                break
+            if c not in selected:
+                selected.append(c)
+
     out = {
         'generated_at': datetime.now().isoformat(timespec='seconds'),
         'lottery': config['name'],
-        'main': candidates[:config['generation']['output_main']],
-        'backup': candidates[config['generation']['output_main']:config['generation']['output_main'] + config['generation']['output_backup']]
+        'main': selected[:main_count],
+        'backup': selected[main_count:main_count + backup_count],
     }
+
+    # 附加筛选逻辑（如果有数据）
+    if history and red_meta and blue_meta and trends:
+        hot_reds, warm_reds, cold_reds, red_freq, red_omit = red_meta
+        hot_blues, warm_blues, cold_blues, blue_freq, blue_omit = blue_meta
+        strategy_name = config['generation'].get('default_strategy', 'balanced')
+
+        sorted_reds = sorted(range(1, 34), key=lambda x: (-red_freq.get(x, 0), x))
+        top5_hot = sorted_reds[:5]
+        bottom5_cold = sorted_reds[-5:]
+
+        sorted_blues = sorted(range(1, 17), key=lambda x: (-blue_freq.get(x, 0), x))
+        top3_hot_blue = sorted_blues[:3]
+        bottom3_cold_blue = sorted_blues[-3:]
+
+        top5_omit_red = sorted(red_omit.keys(), key=lambda x: -red_omit[x])[:5]
+        top3_omit_blue = sorted(blue_omit.keys(), key=lambda x: -blue_omit[x])[:3]
+
+        recent = history[-10:] if len(history) >= 10 else history
+        avg_consec = sum(consecutive_groups(d['reds']) for d in recent) / len(recent) if recent else 0
+
+        out['filtering_logic'] = {
+            'strategy': strategy_name,
+            'pool_size': config['generation']['candidate_pool_size'],
+            'pool_split': {
+                'frequency_guided': int(config['generation']['candidate_pool_size'] * 0.6),
+                'pure_random': config['generation']['candidate_pool_size'] - int(config['generation']['candidate_pool_size'] * 0.6),
+            },
+            'hot_reds': [{'number': n, 'freq': red_freq.get(n, 0)} for n in top5_hot],
+            'cold_reds': [{'number': n, 'freq': red_freq.get(n, 0)} for n in bottom5_cold],
+            'hot_blues': [{'number': n, 'freq': blue_freq.get(n, 0)} for n in top3_hot_blue],
+            'cold_blues': [{'number': n, 'freq': blue_freq.get(n, 0)} for n in bottom3_cold_blue],
+            'top_omit_reds': [{'number': n, 'omission': red_omit[n]} for n in top5_omit_red],
+            'top_omit_blues': [{'number': n, 'omission': blue_omit[n]} for n in top3_omit_blue],
+            'recent_trends': {
+                'prefer_consecutive': trends['prefer_consecutive'],
+                'avg_consecutive_groups': round(avg_consec, 1),
+                'prefer_repeat': trends['prefer_repeat'],
+                'avg_repeat': round(trends['avg_repeat'], 1),
+            },
+            'form_filters': {
+                'span_range': [config['generation'].get('span_min', 18), config['generation'].get('span_max', 30)],
+                'ac_range': [config['generation'].get('ac_min', 4), config['generation'].get('ac_max', 10)],
+                'max_consecutive_groups': config['generation'].get('max_consecutive_groups', 2),
+            },
+            'score_preferences': {
+                'preferred_odd_even': config['generation']['preferred_odd_even'],
+                'preferred_zone_splits': config['generation']['preferred_zone_splits'],
+                'sum_range': config['generation']['sum_range'],
+            },
+            'random_noise': '±8% (0.92~1.08)',
+        }
+
     path = OUTPUT_DIR / f'ssq-picks-{ts}.json'
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
@@ -421,7 +539,7 @@ def calc_compound_cost(red_count, blue_count):
 
 def generate_promo_picks(config, history, promo):
     """生成活动推荐的复式投注号码"""
-    candidates = generate_candidates_v2(config, history)
+    candidates, _, _, _ = generate_candidates_v2(config, history)
     
     # 从高分候选中提取红球池
     top_reds = []
@@ -530,14 +648,50 @@ def main():
         print(f'ℹ️ 详情：{promo.get("website", "请咨询当地福彩网点")}')
     else:
         # 普通选号模式
-        candidates = generate_candidates_v2(config, history)
-        path, out = save_output(candidates, config)
+        candidates, red_meta, blue_meta, trends = generate_candidates_v2(config, history)
+        path, out = save_output(candidates, config, history, red_meta, blue_meta, trends)
+
+        # === 生成筛选逻辑说明 ===
+        hot_reds, warm_reds, cold_reds, red_freq, red_omit = red_meta
+        hot_blues, warm_blues, cold_blues, blue_freq, blue_omit = blue_meta
+        strategy_name = config['generation'].get('default_strategy', 'balanced')
+
+        sorted_reds = sorted(range(1, 34), key=lambda x: (-red_freq.get(x, 0), x))
+        top5_hot = sorted_reds[:5]
+        bottom5_cold = sorted_reds[-5:]
+
+        sorted_blues = sorted(range(1, 17), key=lambda x: (-blue_freq.get(x, 0), x))
+        top3_hot_blue = sorted_blues[:3]
+        bottom3_cold_blue = sorted_blues[-3:]
+
+        top5_omit_red = sorted(red_omit.keys(), key=lambda x: -red_omit[x])[:5]
+        top3_omit_blue = sorted(blue_omit.keys(), key=lambda x: -blue_omit[x])[:3]
+
+        recent = history[-10:] if len(history) >= 10 else history
+        avg_consec = sum(consecutive_groups(d['reds']) for d in recent) / len(recent) if recent else 0
 
         print('双色球选号完成 (v2)')
-        print(f'策略：{config["generation"].get("default_strategy", "balanced")}')
-        print(f'候选池：{config["generation"]["candidate_pool_size"]} 注')
+        print(f'策略：{strategy_name}')
+        print(f'候选池：{config["generation"]["candidate_pool_size"]} 注（60% 频率引导 + 40% 纯随机）')
         print(f'输出文件：{path}')
-        print('\n主推:')
+        print()
+        print('📌 本期筛选逻辑')
+        print(f'  数据范围：近 30 期（热号×3 + 温号×2 + 冷号×1）')
+        print(f'  热号（红）：{", ".join(f"{n:02d}" for n in top5_hot)}')
+        print(f'  冷号（红）：{", ".join(f"{n:02d}" for n in bottom5_cold)}')
+        print(f'  热号（蓝）：{", ".join(f"{n:02d}" for n in top3_hot_blue)}')
+        print(f'  冷号（蓝）：{", ".join(f"{n:02d}" for n in bottom3_cold_blue)}')
+        print(f'  遗漏最大（红）：{", ".join(f"{n:02d}(漏{red_omit[n]}期)" for n in top5_omit_red)}')
+        print(f'  遗漏最大（蓝）：{", ".join(f"{n:02d}(漏{blue_omit[n]}期)" for n in top3_omit_blue)}')
+        print(f'  近期连号趋势：{"偏好连号" if trends["prefer_consecutive"] else "不偏好连号"}（近10期平均 {avg_consec:.1f} 组）')
+        print(f'  近期重号趋势：{"偏好重号" if trends["prefer_repeat"] else "不偏好重号"}（近10期平均 {trends["avg_repeat"]:.1f} 个）')
+        print(f'  形态过滤：极距 18-30 | AC 值 4-10 | 连号 ≤ 2 组')
+        print(f'  评分偏好：奇偶 3:3/4:2/2:4 | 分区 2-2-2/1-2-3 等 | 和值 80-120')
+        print(f'  随机噪声：最终评分 × [0.92, 1.08] 随机因子，打破频率偏差')
+        print(f'  候选池构成：{int(config["generation"]["candidate_pool_size"] * 0.6)} 注频率引导 + {config["generation"]["candidate_pool_size"] - int(config["generation"]["candidate_pool_size"] * 0.6)} 注纯随机')
+        print()
+
+        print('主推:')
         for p in out['main']:
             print('-', fmt_pick_v2(p))
         print('\n备选:')
