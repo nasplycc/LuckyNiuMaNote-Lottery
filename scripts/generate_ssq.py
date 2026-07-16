@@ -362,6 +362,7 @@ def generate_candidates_v2(config, history):
             'span': span,
             'ac': ac,
             'tail_sum': calc_tail_sum(list(reds)),
+            'source': 'scored',
         })
 
     # === 第二部分：纯随机 + 形态筛选（无频率偏差） ===
@@ -393,6 +394,7 @@ def generate_candidates_v2(config, history):
             'span': span,
             'ac': ac,
             'tail_sum': calc_tail_sum(list(reds)),
+            'source': 'random',
         })
 
     candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -487,7 +489,193 @@ def save_output(candidates, config, history=None, red_meta=None, blue_meta=None,
     path = OUTPUT_DIR / f'ssq-picks-{ts}.json'
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
+    # === 共识6+5策略输出 ===
+    red_omit = red_meta[4] if red_meta else None
+    consensus = generate_consensus_6x5(candidates, config, red_omit=red_omit, history=history)
+    out['consensus_6x5'] = consensus
+
     return path, out
+
+
+def generate_consensus_6x5(candidates, config, red_omit=None, history=None):
+    """
+    共识6+5策略 v3（高频追击+软分散+蓝球奇偶分区双覆盖）：
+    - 去掉冷号强制
+    - 去掉分区均衡强制
+    - 纯频次优先：从Top 100频导候选注中统计红球频率，取前6
+    - 软分散：扎堆时才做微调
+    - 蓝球5码：3奇2偶/2奇3偶 + 1区至少2个、2区至少2个
+    - 保留上期共识降权×0.5避免死锁
+    成本：10元/期（不变）
+    """
+    # 频导部分优先，排除随机注噪声
+    top_scored = [c for c in candidates if c.get('source') == 'scored']
+    pool = top_scored[:min(100, len(top_scored))]
+    # 如果频导部分不足50注，回退到全量Top100
+    if len(pool) < 50:
+        pool = candidates[:min(100, len(candidates))]
+
+    top_n = len(pool)
+
+    # 统计红球频率
+    red_counter = Counter()
+    for c in pool:
+        for r in c['reds']:
+            red_counter[r] += 1
+
+    # 上期共识降权：读取上次输出的共识红球，频率×0.5
+    try:
+        output_dir = Path(__file__).resolve().parent.parent / 'outputs'
+        json_files = sorted(output_dir.glob('ssq-picks-*.json'))
+        if json_files:
+            with open(json_files[-1], 'r', encoding='utf-8') as f:
+                last_out = json.load(f)
+            last_consensus_reds = last_out.get('consensus_6x5', {}).get('reds', [])
+            for r in last_consensus_reds:
+                if r in red_counter:
+                    red_counter[r] = int(red_counter[r] * 0.5)
+    except Exception:
+        pass
+
+    # ===== 红球6码：纯频次优先 =====
+    all_reds_sorted = [r for r, _ in red_counter.most_common(33)]
+    selected = set(all_reds_sorted[:6])
+
+    # 软分散：确保3个区不空区、不扎堆
+    zone_dist = {'z1': 0, 'z2': 0, 'z3': 0}
+    for n in selected:
+        if 1 <= n <= 11:
+            zone_dist['z1'] += 1
+        elif 12 <= n <= 22:
+            zone_dist['z2'] += 1
+        else:
+            zone_dist['z3'] += 1
+
+    empty_zones = [z for z, v in zone_dist.items() if v == 0]
+    if empty_zones:
+        # 有空区：从最大区换一个号到空区
+        max_zone = max(zone_dist, key=zone_dist.get)
+        if max_zone == 'z1':
+            max_zone_nums = [n for n in selected if 1 <= n <= 11]
+        elif max_zone == 'z2':
+            max_zone_nums = [n for n in selected if 12 <= n <= 22]
+        else:
+            max_zone_nums = [n for n in selected if 23 <= n <= 33]
+
+        for empty_z in empty_zones:
+            if empty_z == 'z1':
+                replacement_pool = [n for n in all_reds_sorted if 1 <= n <= 11 and n not in selected]
+            elif empty_z == 'z2':
+                replacement_pool = [n for n in all_reds_sorted if 12 <= n <= 22 and n not in selected]
+            else:
+                replacement_pool = [n for n in all_reds_sorted if 23 <= n <= 33 and n not in selected]
+
+            if max_zone_nums and replacement_pool:
+                worst = min(max_zone_nums, key=lambda x: red_counter.get(x, 0))
+                selected.remove(worst)
+                max_zone_nums.remove(worst)
+                selected.add(replacement_pool[0])
+    elif max(zone_dist.values()) >= 4:
+        # 无空区但某区≥4个：换1个到最小区
+        max_zone = max(zone_dist, key=zone_dist.get)
+        min_zone = min(zone_dist, key=zone_dist.get)
+
+        if max_zone == 'z1':
+            max_zone_nums = [n for n in selected if 1 <= n <= 11]
+        elif max_zone == 'z2':
+            max_zone_nums = [n for n in selected if 12 <= n <= 22]
+        else:
+            max_zone_nums = [n for n in selected if 23 <= n <= 33]
+
+        if min_zone == 'z1':
+            replacement_pool = [n for n in all_reds_sorted if 1 <= n <= 11 and n not in selected]
+        elif min_zone == 'z2':
+            replacement_pool = [n for n in all_reds_sorted if 12 <= n <= 22 and n not in selected]
+        else:
+            replacement_pool = [n for n in all_reds_sorted if 23 <= n <= 33 and n not in selected]
+
+        if max_zone_nums and replacement_pool:
+            worst = min(max_zone_nums, key=lambda x: red_counter.get(x, 0))
+            selected.remove(worst)
+            selected.add(replacement_pool[0])
+
+    consensus_reds = sorted(selected)
+
+    # ===== 蓝球5码：奇偶分区双覆盖 =====
+    # 搜集所有蓝球及其评分
+    blue_scores = {}
+    for c in candidates:
+        b = c['blue']
+        if b not in blue_scores or c['score'] > blue_scores[b]:
+            blue_scores[b] = c['score']
+
+    # 将蓝球分为奇偶和分区
+    blue_info = []
+    for b in range(1, 17):
+        blue_info.append({
+            'number': b,
+            'score': blue_scores.get(b, 50),
+            'odd': b % 2 == 1,
+            'zone': 1 if b <= 8 else 2,
+        })
+
+    # 选5个蓝球，约束：奇2-3个、偶2-3个、1区≥2个、2区≥2个
+    best_blues = None
+    best_score_sum = -1
+
+    from itertools import combinations as combos
+    for combo in combos(blue_info, 5):
+        odd_cnt = sum(1 for b in combo if b['odd'])
+        even_cnt = 5 - odd_cnt
+        z1_cnt = sum(1 for b in combo if b['zone'] == 1)
+        z2_cnt = 5 - z1_cnt
+
+        # 奇偶约束：3奇2偶 或 2奇3偶
+        if odd_cnt not in (2, 3):
+            continue
+        # 分区约束：各至少2个
+        if z1_cnt < 2 or z2_cnt < 2:
+            continue
+
+        score_sum = sum(b['score'] for b in combo)
+        if score_sum > best_score_sum:
+            best_score_sum = score_sum
+            best_blues = [b['number'] for b in combo]
+
+    # 容错：如果找不到满足约束的组合，回退到按评分降序取前5
+    if best_blues is None:
+        all_blues_sorted = sorted(blue_info, key=lambda x: -x['score'])
+        best_blues = [b['number'] for b in all_blues_sorted[:5]]
+
+    selected_blues = best_blues[:5]
+
+    # 构造输出
+    consensus_notes = []
+    for i, blue in enumerate(selected_blues):
+        note = {
+            'reds': consensus_reds,
+            'blue': blue,
+            'seq': i + 1,
+            'odd_even': odd_even_split(consensus_reds),
+            'zone_split': zone_split(consensus_reds),
+            'sum': sum(consensus_reds),
+            'consecutive_groups': consecutive_groups(consensus_reds),
+            'span': calc_span(consensus_reds),
+            'ac': calc_ac_value(consensus_reds),
+            'tail_sum': calc_tail_sum(consensus_reds),
+        }
+        consensus_notes.append(note)
+
+    top10_reds = [r for r, _ in red_counter.most_common(10)]
+
+    return {
+        'reds': consensus_reds,
+        'blue_pool': selected_blues,
+        'notes': consensus_notes,
+        'top10_reds': top10_reds,
+        'red_frequencies': {str(r): red_counter[r] for r in consensus_reds},
+        'derivation': f'高频追击+软分散+蓝球奇偶分区覆盖，从Top{top_n}候选注中统计红球',
+    }
 
 
 def fmt_pick_v2(p):
@@ -691,13 +879,23 @@ def main():
         print(f'  候选池构成：{int(config["generation"]["candidate_pool_size"] * 0.6)} 注频率引导 + {config["generation"]["candidate_pool_size"] - int(config["generation"]["candidate_pool_size"] * 0.6)} 注纯随机')
         print()
 
-        print('主推:')
-        for p in out['main']:
-            print('-', fmt_pick_v2(p))
-        print('\n备选:')
-        for p in out['backup']:
-            print('-', fmt_pick_v2(p))
-        
+        print('━' * 38)
+        print('📋 传统 5 注')
+        print('━' * 38)
+        for i, p in enumerate(out['main'] + out['backup'], 1):
+            rs = ' '.join(f'{n:02d}' for n in p['reds'])
+            print(f'  注{i} 红球 {rs}  蓝球 {p["blue"]:02d}')
+
+        print()
+        print('━' * 38)
+        print('🎯 共识6+5')
+        print('━' * 38)
+        c65 = out['consensus_6x5']
+        rs = ' '.join(f'{n:02d}' for n in c65['reds'])
+        for n in c65['notes']:
+            print(f'  注{n["seq"]} 红球 {rs}  蓝球 {n["blue"]:02d}')
+        print(f'  → {c65["derivation"]} · 各10元')
+
         # 检查是否有活动
         promo = get_active_promo()
         if promo:

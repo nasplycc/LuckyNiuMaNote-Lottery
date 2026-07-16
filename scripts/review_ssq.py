@@ -204,7 +204,9 @@ def build_review(draw, picks):
 
     main = picks.get('main', [])
     backup = picks.get('backup', [])
-    all_tickets = [('主推', i + 1, t) for i, t in enumerate(main)] + [('备选', i + 1, t) for i, t in enumerate(backup)]
+    consensus = picks.get('consensus_6x5', {})
+    consensus_notes = consensus.get('notes', [])
+    all_tickets = [('主推', i + 1, t) for i, t in enumerate(main)] + [('备选', i + 1, t) for i, t in enumerate(backup)] + [('共识6+5', n['seq'], n) for n in consensus_notes]
 
     best = None
     hit_lines = []
