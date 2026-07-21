@@ -260,12 +260,16 @@ def build_review(draw, picks):
         lines.append(f"  红球：{' '.join(f'{n:02d}' for n in consensus_reds)}")
     lines.extend([f"• {x}" for x in c65_lines])
 
-    # === 合计 ===
-    total_prize = v2_prize + c65_total_prize
-    total_cost = 10 + 10  # 传统5注10元 + 6+5共10元
-    net = total_prize - total_cost
+    # === 合计（默认只买6+5，10元） ===
+    actual_cost = 10  # 只买6+5，10元
+    actual_prize = c65_total_prize
+    actual_net = actual_prize - actual_cost
+    if v2_prize > 0:
+        v2_note = f"传统5注 ¥{v2_prize}（未买参考）"
+    else:
+        v2_note = f"传统5注 ¥{v2_prize}"
     lines.append("")
-    lines.append(f"💰 本期汇总：传统5注 ¥{v2_prize}｜6+5 ¥{c65_total_prize}｜合计 ¥{total_prize}｜成本 ¥{total_cost}｜净{'盈' if net >= 0 else '亏'} ¥{abs(net)}")
+    lines.append(f"💰 本期汇总：{v2_note}｜6+5 ¥{c65_total_prize}｜实付 ¥{actual_cost}｜净{'盈' if actual_net >= 0 else '亏'} ¥{abs(actual_net)}")
 
     # 最佳表现
     all_best = None
