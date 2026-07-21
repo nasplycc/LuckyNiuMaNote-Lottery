@@ -486,13 +486,14 @@ def save_output(candidates, config, history=None, red_meta=None, blue_meta=None,
             'random_noise': '±8% (0.92~1.08)',
         }
 
-    path = OUTPUT_DIR / f'ssq-picks-{ts}.json'
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    # === 共识6+5策略输出 ===
+    # === 共识6+5策略输出（先计算，再写文件） ===
     red_omit = red_meta[4] if red_meta else None
     consensus = generate_consensus_6x5(candidates, config, red_omit=red_omit, history=history)
     out['consensus_6x5'] = consensus
+
+    path = OUTPUT_DIR / f'ssq-picks-{ts}.json'
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
 
     return path, out
 
@@ -880,21 +881,22 @@ def main():
         print()
 
         print('━' * 38)
-        print('📋 传统 5 注')
-        print('━' * 38)
-        for i, p in enumerate(out['main'] + out['backup'], 1):
-            rs = ' '.join(f'{n:02d}' for n in p['reds'])
-            print(f'  注{i} 红球 {rs}  蓝球 {p["blue"]:02d}')
-
-        print()
-        print('━' * 38)
-        print('🎯 共识6+5')
+        print('🎯 共识6+5（主推）')
         print('━' * 38)
         c65 = out['consensus_6x5']
         rs = ' '.join(f'{n:02d}' for n in c65['reds'])
         for n in c65['notes']:
             print(f'  注{n["seq"]} 红球 {rs}  蓝球 {n["blue"]:02d}')
-        print(f'  → {c65["derivation"]} · 各10元')
+        print(f'  → 同组红球配5个蓝球，共5注10元')
+        print(f'  → {c65["derivation"]}')
+
+        print()
+        print('━' * 38)
+        print('📋 传统 5 注（辅推）')
+        print('━' * 38)
+        for i, p in enumerate(out['main'] + out['backup'], 1):
+            rs = ' '.join(f'{n:02d}' for n in p['reds'])
+            print(f'  注{i} 红球 {rs}  蓝球 {p["blue"]:02d}')
 
         # 检查是否有活动
         promo = get_active_promo()

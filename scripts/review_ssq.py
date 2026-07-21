@@ -206,39 +206,82 @@ def build_review(draw, picks):
     backup = picks.get('backup', [])
     consensus = picks.get('consensus_6x5', {})
     consensus_notes = consensus.get('notes', [])
-    all_tickets = [('主推', i + 1, t) for i, t in enumerate(main)] + [('备选', i + 1, t) for i, t in enumerate(backup)] + [('共识6+5', n['seq'], n) for n in consensus_notes]
+    consensus_reds = consensus.get('reds', [])
 
-    best = None
-    hit_lines = []
-    total_prize = 0
-    for kind, idx, ticket in all_tickets:
+    # === V2 传统5注命中情况 ===
+    v2_lines = []
+    v2_prize = 0
+    v2_best = None
+    for kind, idx, ticket in [('主推', i + 1, t) for i, t in enumerate(main)] + [('备选', i + 1, t) for i, t in enumerate(backup)]:
         cmp = compare_ticket(ticket, draw['reds'], draw['blue'])
-        score_tuple = (cmp['red_count'], 1 if cmp['blue_hit'] else 0)
-        if best is None or score_tuple > best[0]:
-            best = (score_tuple, kind, idx, ticket, cmp)
-        
+        score = (cmp['red_count'], 1 if cmp['blue_hit'] else 0)
+        if v2_best is None or score > v2_best[0]:
+            v2_best = (score, kind, idx, cmp)
+        v2_prize += cmp['prize_amount']
         hit_text = f"{kind}{idx}：{cmp['red_count']}红"
         if cmp['red_hits']:
-            hit_text += f"（命中 {','.join(f'{n:02d}' for n in cmp['red_hits'])}）"
+            hit_text += f"（{','.join(f'{n:02d}' for n in cmp['red_hits'])}）"
         if cmp['blue_hit']:
             hit_text += " + 蓝"
         if cmp['prize_level']:
             hit_text += f" → {cmp['prize_level']} {cmp['prize_amount']:,}元"
         else:
-            hit_text += " → 未中奖 0 元"
-        
-        total_prize += cmp['prize_amount']
-        hit_lines.append(hit_text)
+            hit_text += " → 未中奖 0元"
+        v2_lines.append(hit_text)
 
     lines.append("")
-    lines.append("🎯 本期命中情况：")
-    lines.extend([f"- {x}" for x in hit_lines])
+    lines.append("🎯 传统5注命中情况：")
+    lines.extend([f"• {x}" for x in v2_lines])
+
+    # === 共识6+5命中情况 ===
+    c65_total_prize = 0
+    c65_best = None
+    c65_lines = []
+    for n in consensus_notes:
+        cmp = compare_ticket(n, draw['reds'], draw['blue'])
+        score = (cmp['red_count'], 1 if cmp['blue_hit'] else 0)
+        if c65_best is None or score > c65_best[0]:
+            c65_best = (score, n['seq'], cmp)
+        c65_total_prize += cmp['prize_amount']
+        hit_text = f"注{n['seq']}：{cmp['red_count']}红"
+        if cmp['red_hits']:
+            hit_text += f"（{','.join(f'{n:02d}' for n in cmp['red_hits'])}）"
+        if cmp['blue_hit']:
+            hit_text += " + 蓝"
+        if cmp['prize_level']:
+            hit_text += f" → {cmp['prize_level']} {cmp['prize_amount']:,}元"
+        else:
+            hit_text += " → 未中奖 0元"
+        c65_lines.append(hit_text)
 
     lines.append("")
-    lines.append(f"本期合计奖金：{total_prize:,}元")
+    lines.append("🏆 共识6+5选号命中情况：")
+    if consensus_reds:
+        lines.append(f"  红球：{' '.join(f'{n:02d}' for n in consensus_reds)}")
+    lines.extend([f"• {x}" for x in c65_lines])
+
+    # === 合计 ===
+    total_prize = v2_prize + c65_total_prize
+    total_cost = 10 + 10  # 传统5注10元 + 6+5共10元
+    net = total_prize - total_cost
     lines.append("")
-    best_cmp = best[4]
-    lines.append(f"本期最好表现：{best[1]}{best[2]}，{best_cmp['red_count']}红{' + 蓝' if best_cmp['blue_hit'] else ''}")
+    lines.append(f"💰 本期汇总：传统5注 ¥{v2_prize}｜6+5 ¥{c65_total_prize}｜合计 ¥{total_prize}｜成本 ¥{total_cost}｜净{'盈' if net >= 0 else '亏'} ¥{abs(net)}")
+
+    # 最佳表现
+    all_best = None
+    if v2_best and c65_best:
+        if v2_best[0] >= c65_best[0]:
+            all_best = ('传统5注', v2_best)
+        else:
+            all_best = ('共识6+5', c65_best)
+    elif v2_best:
+        all_best = ('传统5注', v2_best)
+    elif c65_best:
+        all_best = ('共识6+5', c65_best)
+    
+    if all_best:
+        bc = all_best[1][3]
+        lines.append(f"🏅 本期最佳：{all_best[0]}{all_best[1][2]}，{bc['red_count']}红{' + 蓝' if bc['blue_hit'] else ''}")
 
     # 奖金信息（2026-04-09 固化）
     # 优先从历史文件/API 获取，如果没有则检查手动录入
