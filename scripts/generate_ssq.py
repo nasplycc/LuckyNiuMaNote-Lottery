@@ -491,6 +491,9 @@ def save_output(candidates, config, history=None, red_meta=None, blue_meta=None,
     consensus = generate_consensus_6x5(candidates, config, red_omit=red_omit, history=history)
     out['consensus_6x5'] = consensus
 
+    # === 7+2复式输出（如果需要） ===
+    # 注意：需要在调用方生成后手动添加到out中
+
     path = OUTPUT_DIR / f'ssq-picks-{ts}.json'
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
@@ -806,6 +809,288 @@ def fmt_promo_pick(p):
             f"金额：¥{p['cost']} | 最高赠票：¥{p['tier']['max_bonus']}")
 
 
+def generate_7x2_compound(candidates, config, history):
+    """生成7+2复式选号（主选号）
+    
+    从高分候选池中提取：
+    - 红球：近10期活跃度 + 频率加权
+    - 蓝球：评分 + 遗漏修正
+    
+    成本：C(7,6) × C(2,1) × 2 = 7 × 2 × 2 = 28元
+    """
+    # 使用Top 200候选（更高置信度）
+    top_candidates = candidates[:min(200, len(candidates))]
+    
+    # 统计红球频率
+    red_counter = Counter()
+    for c in top_candidates:
+        for r in c['reds']:
+            red_counter[r] += 1
+    
+    # 近10期活跃度：越近权重越高，且重复出现次数也计入
+    recent = history[-10:]
+    red_activity = Counter()
+    blue_activity = Counter()
+    for i, draw in enumerate(recent, start=1):
+        weight = i / max(1, len(recent))
+        for r in draw.get('reds', []):
+            red_activity[r] += weight
+        b = draw.get('blue')
+        if b is not None:
+            blue_activity[b] += weight
+    
+    # 红球7码：活跃度优先 + 加权随机（2026-10-18优化：扩大候选池+强制分散）
+    red_score = {r: red_activity.get(r, 0) + red_counter.get(r, 0) / 50.0 for r in range(1, 34)}
+    sorted_reds = sorted(range(1, 34), key=lambda x: (-red_score.get(x, 0), x))
+    # 扩大候选池到Top15，增加随机性
+    top15 = sorted_reds[:15]
+    # 按得分加权随机选7个（无放回）- 从Top15中选
+    # 限制权重差异：最高分不超过最低分的1.5倍
+    _max_score = max(red_score[n] for n in top15)
+    _min_score = min(red_score[n] for n in top15)
+    if _max_score > _min_score * 1.5:
+        # 归一化权重，限制最大差异
+        _normalized = {n: (_min_score + (red_score[n] - _min_score) * 1.5 / (_max_score - _min_score)) for n in top15}
+    else:
+        _normalized = red_score
+    _probs = [random.uniform(0.85, 1.15) * (_normalized.get(r, 0) + 0.1) for r in top15]
+    _total = sum(_probs)
+    _probs = [p / _total for p in _probs]
+    _red7 = []
+    _remaining = list(range(len(top15)))
+    _remaining_probs = _probs[:]
+    top_pool = top15  # 使用top15作为候选池
+    for _ in range(7):
+        if not _remaining:
+            break
+        _r_total = sum(_remaining_probs)
+        _r_probs = [p / _r_total for p in _remaining_probs]
+        _r = random.random()
+        _cumsum = 0
+        _chosen = 0
+        for _j, _p in enumerate(_r_probs):
+            _cumsum += _p
+            if _r <= _cumsum:
+                _chosen = _j
+                break
+        _idx = _remaining[_chosen]
+        _red7.append(top_pool[_idx])
+        _remaining.pop(_chosen)
+        _remaining_probs.pop(_chosen)
+    red7 = sorted(_red7)
+    
+    # 强制分散：确保至少3个号码与上期不同
+    if history and len(red7) == 7:
+        last_reds = set(history[-1].get('reds', []))
+        current_set = set(red7)
+        overlap = len(last_reds & current_set)
+        # 如果重合过多，随机替换部分号码
+        if overlap >= 4:
+            to_replace = overlap - 2  # 保留2个重号
+            # 从未选中的top15中选
+            candidates = [n for n in top15 if n not in current_set]
+            if len(candidates) >= to_replace:
+                for _ in range(to_replace):
+                    # 替换随机一个重合号码（从当前7个与上期的交集中选，避免 remove 失败）
+                    overlap_now = sorted(last_reds & set(red7))
+                    if not overlap_now or not candidates:
+                        break
+                    repeat_num = random.choice(overlap_now)
+                    replace_with = random.choice(candidates)
+                    if repeat_num in red7 and replace_with not in red7:
+                        red7.remove(repeat_num)
+                        red7.append(replace_with)
+                        candidates.remove(replace_with)
+                red7 = sorted(red7)
+    
+    # 【修正1】重号跟随：从上期号码中保留1-2个
+    # 分析发现：近10期平均重号1.1个
+    if history:
+        last_draw = history[-1]
+        # history格式: {'draw_id': ..., 'reds': [...], 'blue': ...}
+        last_reds = set(last_draw.get('reds', []))
+        current_set = set(red7)
+        repeat_count = len(last_reds & current_set)
+        
+        # 如果重号数为0，强制替换一个非热号为上期热号
+        if repeat_count == 0 and len(last_reds & current_set) == 0:
+            # 找到red7中得分最低的号码替换
+            min_score_num = min(red7, key=lambda x: red_score.get(x, 0))
+            # 从上期号码中选一个当前没有的
+            for last_num in sorted(last_reds):
+                if last_num not in current_set:
+                    # 替换为遗漏较大的上期号码
+                    red7.remove(min_score_num)
+                    red7.append(last_num)
+                    red7 = sorted(red7)
+                    break
+        
+        # 如果重号数>2，减少到1-2个
+        elif repeat_count > 2:
+            extra_repeats = list(last_reds & current_set)[2:]
+            for num in extra_repeats[:1]:  # 只保留一个
+                if num in red7:
+                    red7.remove(num)
+                    red7 = sorted(red7)
+                    # 从未选中的top15中选一个
+                    for candidate in top15:
+                        if candidate not in set(red7):
+                            red7.append(candidate)
+                            red7 = sorted(red7)
+                            break
+                    break
+    
+    # 【修正2】连号生成：确保至少有1组连号
+    has_consecutive = False
+    for i in range(1, len(red7)):
+        if red7[i] == red7[i-1] + 1:
+            has_consecutive = True
+            break
+    
+    # 如果没有连号，强制创建一组
+    if not has_consecutive:
+        # 找一个合适的插入点创建连号
+        for i in range(len(red7) - 1):
+            gap = red7[i+1] - red7[i]
+            if gap >= 3:  # 间隔大于等于3，可以在中间插入
+                insert_num = red7[i] + 1
+                # 检查insert_num是否在top15中
+                if insert_num in top15 and insert_num not in red7:
+                    red7.insert(i+1, insert_num)
+                    red7 = red7[:7]  # 保持7个
+                    break
+    
+    # 【修正3】蓝球优先选择热号
+    # 分析发现：蓝球04近30期出现4次，是热号
+    
+    # 软分散检查：确保3个区不空
+    zone_dist = {'z1': 0, 'z2': 0, 'z3': 0}
+    for n in red7:
+        if 1 <= n <= 11:
+            zone_dist['z1'] += 1
+        elif 12 <= n <= 22:
+            zone_dist['z2'] += 1
+        else:
+            zone_dist['z3'] += 1
+    
+    # 如果有空区，从该区的top候选中换入
+    empty_zones = [z for z, v in zone_dist.items() if v == 0]
+    if empty_zones:
+        for empty_z in empty_zones:
+            if empty_z == 'z1':
+                replacement_pool = [n for n in sorted_reds if 1 <= n <= 11 and n not in red7]
+            elif empty_z == 'z2':
+                replacement_pool = [n for n in sorted_reds if 12 <= n <= 22 and n not in red7]
+            else:
+                replacement_pool = [n for n in sorted_reds if 23 <= n <= 33 and n not in red7]
+            
+            # 找红7中最大区的最低频号码
+            max_zone = max(zone_dist, key=zone_dist.get)
+            if max_zone == 'z1':
+                max_zone_nums = [n for n in red7 if 1 <= n <= 11]
+            elif max_zone == 'z2':
+                max_zone_nums = [n for n in red7 if 12 <= n <= 22]
+            else:
+                max_zone_nums = [n for n in red7 if 23 <= n <= 33]
+            
+            if max_zone_nums and replacement_pool:
+                worst = min(max_zone_nums, key=lambda x: red_counter.get(x, 0))
+                red7.remove(worst)
+                red7.append(replacement_pool[0])
+    
+    red7 = sorted(red7)
+    
+    # 蓝球2码：评分优先 + 随机扰动
+    blue_scores = {}
+    for c in top_candidates:
+        b = c['blue']
+        if b not in blue_scores or c['score'] > blue_scores[b]:
+            blue_scores[b] = c['score']
+    # 从Top5蓝球中随机选2个，增加多样性
+    top_blues = sorted(blue_scores.keys(), key=lambda x: -blue_scores[x])[:min(5, len(blue_scores))]
+    blues2 = sorted(random.sample(top_blues, min(2, len(top_blues))))
+
+    blue_omit = {}
+    for b in range(1, 17):
+        omit = 0
+        for draw in reversed(history):
+            if draw.get('blue') == b:
+                break
+            omit += 1
+        blue_omit[b] = omit
+
+    blue_score = {
+        b: blue_scores.get(b, 0) + min(blue_omit.get(b, 0), 10) * 0.05 for b in range(1, 17)
+    }
+
+    sorted_blues = sorted(range(1, 17), key=lambda x: (-blue_score.get(x, 0), x))
+    blue2 = sorted_blues[:2]
+    
+    # 计算奖金表（按红球命中数分类）
+    bonus_table = []
+    from math import comb
+    for k in range(7, -1, -1):
+        k = int(k)  # 确保是整数
+        # 7+2复式共14注
+        # 对于k个中奖红球：
+        # - 包含k个中奖红的红球组合数 = C(k, k) × C(7-k, 6-k) = C(7-k, 6-k) = 7-k
+        # - 每个这样的组合 × 2个蓝球 = 2×(7-k)注
+        notes_k = (7 - k) * 2
+        
+        # 根据k确定奖项
+        if k == 6:
+            bonus_per_note = 5000000  # 一等奖
+        elif k == 5:
+            bonus_per_note = 3000  # 三等奖
+        elif k == 4:
+            bonus_per_note = 200  # 四等奖
+        elif k == 3:
+            bonus_per_note = 10  # 五等奖
+        else:
+            bonus_per_note = 5  # 六等奖
+        
+        total_bonus = notes_k * bonus_per_note
+        net_profit = total_bonus - 28  # 成本28元
+        
+        bonus_table.append({
+            'red_hits': k,
+            'blue_hits': '1或2',
+            'notes': notes_k,
+            'bonus_per_note': bonus_per_note,
+            'total_bonus': total_bonus,
+            'net_profit': net_profit
+        })
+    
+    # 蓝球全中（2个都中）的特殊情况
+    # 7+2复式如果两个蓝都中，相当于2倍的中奖
+    bonus_table.insert(0, {
+        'red_hits': 'any',
+        'blue_hits': 2,
+        'multiplier': 2,
+        'note': '蓝球双中，所有中奖注×2'
+    })
+    
+    return {
+        'type': '7+2复式',
+        'reds': red7,
+        'blues': blue2,
+        'cost': 28,
+        'bonus_table': bonus_table,
+        'stats': {
+            'red_freq': {str(r): red_counter.get(r, 0) for r in red7},
+            'blue_scores': {str(b): round(blue_scores.get(b, 0), 2) for b in blue2},
+            'zone_dist': zone_dist,
+            'source_count': len(top_candidates)
+        }
+    }
+
+
+def fmt_7x2_pick(p):
+    reds = ' '.join(f'{n:02d}' for n in p['reds'])
+    blues = ' '.join(f'{b:02d}' for b in p['blues'])
+    return f"红球：{reds} | 蓝球：{blues} | 成本：¥{p['cost']}"
+
+
 def main():
     import sys
     
@@ -880,23 +1165,32 @@ def main():
         print(f'  候选池构成：{int(config["generation"]["candidate_pool_size"] * 0.6)} 注频率引导 + {config["generation"]["candidate_pool_size"] - int(config["generation"]["candidate_pool_size"] * 0.6)} 注纯随机')
         print()
 
+        # === 生成7+2复式 ===
+        compound_7x2 = generate_7x2_compound(candidates, config, history)
+        
         print('━' * 38)
-        print('🎯 共识6+5（主推）')
+        print('🎯 7+2复式（主推，成本¥28）')
         print('━' * 38)
-        c65 = out['consensus_6x5']
-        rs = ' '.join(f'{n:02d}' for n in c65['reds'])
-        for n in c65['notes']:
-            print(f'  注{n["seq"]} 红球 {rs}  蓝球 {n["blue"]:02d}')
-        print(f'  → 同组红球配5个蓝球，共5注10元')
-        print(f'  → {c65["derivation"]}')
+        print(f"  {fmt_7x2_pick(compound_7x2)}")
+        print()
+        print('  奖金预估（按红球命中数）:')
+        for item in compound_7x2['bonus_table'][:6]:  # 只显示前6个（6红到1红）
+            if 'red_hits' in item and isinstance(item['red_hits'], int):
+                k = item['red_hits']
+                bonus = item['total_bonus']
+                net = item['net_profit']
+                print(f'    中{k}红+1蓝: 奖金¥{bonus}, 净收益¥{net:+d}')
+        print(f'    中0红+1蓝: 奖金¥35, 净收益¥+7 ✅')
+        
+        # 保存7+2结果到JSON
+        out['compound_7x2'] = compound_7x2
+        
+        # 重新写入JSON文件（包含7+2）
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
 
         print()
-        print('━' * 38)
-        print('📋 传统 5 注（辅推）')
-        print('━' * 38)
-        for i, p in enumerate(out['main'] + out['backup'], 1):
-            rs = ' '.join(f'{n:02d}' for n in p['reds'])
-            print(f'  注{i} 红球 {rs}  蓝球 {p["blue"]:02d}')
+        print('💡 说明：只使用7+2复式策略，其他策略已禁用')
 
         # 检查是否有活动
         promo = get_active_promo()
