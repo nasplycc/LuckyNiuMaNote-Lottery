@@ -1,0 +1,14 @@
+{
+  "title": "双色球累计支出记录",
+  "updated": "2026-10-13",
+  "summary": {
+    "total_periods": 2,
+    "total_cost": 56,
+    "total_winnings": 0,
+    "net_loss": 56
+  },
+  "records": [
+    {"period": "26116", "date": "2026-10-11", "cost": 28, "winnings": 0, "net": -28},
+    {"period": "26117", "date": "2026-10-13", "cost": 28, "winnings": 0, "net": -28}
+  ]
+}

@@ -302,9 +302,10 @@ def score_candidate_v2(reds, blue, history, config, red_meta, blue_meta, trends)
         score *= 1.01
 
     # === 2026-05-14 升级: 增加随机噪声 ===
+    # === 2026-10-23 升级: 噪声提升到±15%，增强选号多样性，打破热池惯性 ===
     # 双色球是独立随机事件，历史频率无预测力
-    # 在最终评分中加入±8%随机噪声，打破频率偏差
-    random_factor = random.uniform(0.92, 1.08)
+    # 在最终评分中加入±15%随机噪声，打破频率偏差
+    random_factor = random.uniform(0.85, 1.15)
     score *= random_factor
 
     return round(score, 4)
@@ -483,7 +484,7 @@ def save_output(candidates, config, history=None, red_meta=None, blue_meta=None,
                 'preferred_zone_splits': config['generation']['preferred_zone_splits'],
                 'sum_range': config['generation']['sum_range'],
             },
-            'random_noise': '±8% (0.92~1.08)',
+            'random_noise': '±15% (0.85~1.15)',
         }
 
     # === 共识6+5策略输出（先计算，再写文件） ===
@@ -1000,16 +1001,15 @@ def generate_7x2_compound(candidates, config, history):
     
     red7 = sorted(red7)
     
-    # 蓝球2码：评分优先 + 随机扰动
-    blue_scores = {}
-    for c in top_candidates:
-        b = c['blue']
-        if b not in blue_scores or c['score'] > blue_scores[b]:
-            blue_scores[b] = c['score']
-    # 从Top5蓝球中随机选2个，增加多样性
-    top_blues = sorted(blue_scores.keys(), key=lambda x: -blue_scores[x])[:min(5, len(blue_scores))]
-    blues2 = sorted(random.sample(top_blues, min(2, len(top_blues))))
+    # 蓝球2码：2026-10-29 改为可配置策略（默认热号+次热号）
+    # 用户要求方案A：停止追冷，按近30期综合频率排序取Top2
+    # 策略开关：blue_strategy = hot_top2（推荐）| cold_warm | hot_omission（旧）
+    blue_strategy = config['generation'].get('blue_strategy', 'hot_top2')
 
+    # 冷/温/热动态分类（蓝球）
+    hot_blues, warm_blues, cold_blues, blue_freq = hot_warm_cold_dynamic(history, 16, config, blue=True)
+
+    # 遗漏统计
     blue_omit = {}
     for b in range(1, 17):
         omit = 0
@@ -1019,12 +1019,38 @@ def generate_7x2_compound(candidates, config, history):
             omit += 1
         blue_omit[b] = omit
 
-    blue_score = {
-        b: blue_scores.get(b, 0) + min(blue_omit.get(b, 0), 10) * 0.05 for b in range(1, 17)
-    }
-
-    sorted_blues = sorted(range(1, 17), key=lambda x: (-blue_score.get(x, 0), x))
-    blue2 = sorted_blues[:2]
+    if blue_strategy == 'hot_top2':
+        # 热号+次热号：按综合频率（近期×3+中期×2+远期×1）排序取Top2
+        ranked_blues = sorted(range(1, 17), key=lambda b: (-blue_freq.get(b, 0), b))
+        blue2 = sorted(ranked_blues[:2])
+    elif blue_strategy == 'cold_warm':
+        # 冷温搭配：1冷（冷池中遗漏最大）+ 1温（温池中综合频率最高）
+        cold_pool = list(cold_blues)
+        warm_pool = list(warm_blues)
+        if cold_pool:
+            cold_blue = max(cold_pool, key=lambda b: blue_omit.get(b, 0))
+        else:
+            cold_blue = 13  # 兜底
+        if warm_pool:
+            warm_blue = max(warm_pool, key=lambda b: blue_freq.get(b, 0))
+        else:
+            warm_blue = 5  # 兜底
+        blue2 = sorted({cold_blue, warm_blue})
+    else:
+        # 旧策略：高频1 + 遗漏Top1（纯冷追）
+        blue_scores = {}
+        for c in top_candidates:
+            b = c['blue']
+            if b not in blue_scores or c['score'] > blue_scores[b]:
+                blue_scores[b] = c['score']
+        top_blue = sorted(blue_scores.keys(), key=lambda x: -blue_scores[x])[:1]
+        hot_blue = top_blue[0] if top_blue else 1
+        # 遗漏Top1排除热蓝本身，避免两席都是热蓝
+        omission_blue = max(
+            (b for b in range(1, 17) if b != hot_blue),
+            key=lambda b: blue_omit.get(b, 0)
+        )
+        blue2 = sorted({hot_blue, omission_blue})
     
     # 计算奖金表（按红球命中数分类）
     bonus_table = []
@@ -1150,7 +1176,7 @@ def main():
         print(f'输出文件：{path}')
         print()
         print('📌 本期筛选逻辑')
-        print(f'  数据范围：近 30 期（热号×3 + 温号×2 + 冷号×1）')
+        print(f'  数据范围：近 60 期（热30期×3 + 温40期×2 + 冷60期×1）')
         print(f'  热号（红）：{", ".join(f"{n:02d}" for n in top5_hot)}')
         print(f'  冷号（红）：{", ".join(f"{n:02d}" for n in bottom5_cold)}')
         print(f'  热号（蓝）：{", ".join(f"{n:02d}" for n in top3_hot_blue)}')
@@ -1160,8 +1186,8 @@ def main():
         print(f'  近期连号趋势：{"偏好连号" if trends["prefer_consecutive"] else "不偏好连号"}（近10期平均 {avg_consec:.1f} 组）')
         print(f'  近期重号趋势：{"偏好重号" if trends["prefer_repeat"] else "不偏好重号"}（近10期平均 {trends["avg_repeat"]:.1f} 个）')
         print(f'  形态过滤：极距 18-30 | AC 值 4-10 | 连号 ≤ 2 组')
-        print(f'  评分偏好：奇偶 3:3/4:2/2:4 | 分区 2-2-2/1-2-3 等 | 和值 80-120')
-        print(f'  随机噪声：最终评分 × [0.92, 1.08] 随机因子，打破频率偏差')
+        print(f'  评分偏好：奇偶 3:3/4:2/2:4 | 分区 2-2-2/1-2-3 等 | 和值 70-130')
+        print(f'  随机噪声：最终评分 × [0.85, 1.15] 随机因子，打破频率偏差')
         print(f'  候选池构成：{int(config["generation"]["candidate_pool_size"] * 0.6)} 注频率引导 + {config["generation"]["candidate_pool_size"] - int(config["generation"]["candidate_pool_size"] * 0.6)} 注纯随机')
         print()
 

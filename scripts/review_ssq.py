@@ -5,15 +5,16 @@
 - 更新历史开奖数据
 - 读取最新一期开奖结果
 - 对比当期发号结果
+- 优先按 compound_7x2（7+2复式）复盘
 - 输出命中情况与简短规则复盘建议
 """
 
 import csv
+import math
 import json
-from pathlib import Path
-from datetime import datetime
 import subprocess
-import re
+from itertools import combinations
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_PATH = ROOT / 'data' / 'ssq_history.csv'
@@ -46,19 +47,46 @@ def load_latest_draw():
 
 
 def load_latest_pick_for_draw(draw_date=None):
+    # 优先使用 picks-review-map.json 中记录的"用户实际购买"选号文件，
+    # 避免同一天存在多份选号文件时默认取最新（19:30）而拿错目标。
+    map_path = ROOT / 'memory' / 'picks-review-map.json'
+    if map_path.exists():
+        try:
+            m = json.load(map_path.open(encoding='utf-8'))
+            # 找到该日期对应的期号记录
+            ymd = draw_date.replace('-', '')
+            for draw_id, rec in m.items():
+                rid = str(draw_id)
+                rec_date = str(rec.get('draw_date', '')).replace('-', '')
+                hit = bool(ymd and (
+                    rec_date.endswith(ymd[-6:]) or  # draw_date 日期匹配
+                    rid.endswith(ymd[-3:])          # 期号尾三位匹配
+                ))
+                if not hit and len(m) == 1:
+                    hit = True  # 兜底：唯一记录直接采用
+                if hit:
+                    rel = rec.get('picks_file')
+                    if rel:
+                        p = ROOT / rel
+                        if p.exists():
+                            with open(p, 'r', encoding='utf-8') as f:
+                                return json.load(f), p
+        except Exception as e:
+            print(f"⚠️ 读取 picks-review-map.json 失败({e})，回退默认逻辑")
+
     files = sorted(OUTPUTS_DIR.glob('ssq-picks-*.json'))
     if not files:
         return None, None
 
-    # 优先取今天最新一期；否则取最新文件
     target = None
     if draw_date:
         ymd = draw_date.replace('-', '')
         same_day = [p for p in files if ymd in p.name]
         if same_day:
-            target = same_day[-1]
-    if target is None:
-        target = files[-1]
+            # 优先读取当天最新的（包含完整compound_7x2数据）
+            # 按时间戳排序，取最新的
+            same_day.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            target = same_day[0]
 
     with open(target, 'r', encoding='utf-8') as f:
         return json.load(f), target
@@ -68,24 +96,16 @@ def compare_ticket(ticket, actual_reds, actual_blue):
     red_hits = sorted(set(ticket['reds']) & set(actual_reds))
     blue_hit = ticket.get('blue') == actual_blue
     red_count = len(red_hits)
-    
-    # 计算中奖等级和奖金（2026-04-09 固化）
-    # 双色球中奖规则：
-    # 一等奖：6 红 +1 蓝 → 浮动（默认按 500 万估算）
-    # 二等奖：6 红 +0 蓝 → 浮动（默认按 10 万估算）
-    # 三等奖：5 红 +1 蓝 → 3000 元
-    # 四等奖：5 红 +0 蓝 或 4 红 +1 蓝 → 200 元
-    # 五等奖：4 红 +0 蓝 或 3 红 +1 蓝 → 10 元
-    # 六等奖：2 红 +1 蓝 或 1 红 +1 蓝 或 0 红 +1 蓝 → 5 元
+
     prize_amount = 0
     prize_level = None
-    
+
     if red_count == 6 and blue_hit:
         prize_level = '一等奖'
-        prize_amount = 5000000  # 估算
+        prize_amount = 5000000
     elif red_count == 6 and not blue_hit:
         prize_level = '二等奖'
-        prize_amount = 100000  # 估算
+        prize_amount = 100000
     elif red_count == 5 and blue_hit:
         prize_level = '三等奖'
         prize_amount = 3000
@@ -110,7 +130,7 @@ def compare_ticket(ticket, actual_reds, actual_blue):
     elif red_count == 0 and blue_hit:
         prize_level = '六等奖'
         prize_amount = 5
-    
+
     return {
         'red_count': red_count,
         'red_hits': red_hits,
@@ -121,13 +141,6 @@ def compare_ticket(ticket, actual_reds, actual_blue):
 
 
 def get_prize_info(draw_id):
-    """
-    获取双色球当期奖金信息。
-    优先从历史数据文件读取，若没有则返回 None（后续可扩展从其他渠道获取）。
-    返回：dict { 'prize_1': {'count': int, 'amount': float}, 'prize_2': {...}, ... }
-    如果找不到奖金信息，返回 None。
-    """
-    # 先尝试从历史文件读取
     try:
         with open(DATA_PATH, 'r', encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
@@ -153,9 +166,6 @@ def get_prize_info(draw_id):
                 return prize_info
     except Exception:
         pass
-
-    # 2026-04-09 固化：如果历史文件没有奖金信息，返回 None
-    # 后续可通过手动更新或其他方式补充
     return None
 
 
@@ -175,7 +185,7 @@ def summarize_shape(draw):
     consecutive = []
     group = [reds[0]]
     for i in range(1, len(reds)):
-        if reds[i] == reds[i-1] + 1:
+        if reds[i] == reds[i - 1] + 1:
             group.append(reds[i])
         else:
             if len(group) >= 2:
@@ -191,6 +201,49 @@ def summarize_shape(draw):
     }
 
 
+def summarize_compound_7x2(compound, draw):
+    reds = set(compound['reds'])
+    blues = set(compound['blues'])
+    red_hits = sorted(reds & set(draw['reds']))
+    blue_hits = sorted(blues & {draw['blue']})
+    red_count = len(red_hits)
+    blue_count = len(blue_hits)
+
+    bonus = 0
+    per_note = []
+    for rcombo in combinations(sorted(reds), 6):
+        rc = len(set(rcombo) & set(draw['reds']))
+        for blue in sorted(blues):
+            bh = (blue == draw['blue'])
+            if rc == 6 and bh:
+                bonus += 5000000; per_note.append(('一等奖', 5000000))
+            elif rc == 5 and bh:
+                bonus += 3000; per_note.append(('三等奖', 3000))
+            elif rc == 4:
+                bonus += 200; per_note.append(('四等奖', 200))
+            elif rc == 3 and bh:
+                bonus += 10; per_note.append(('五等奖', 10))
+            elif bh:
+                bonus += 5; per_note.append(('六等奖', 5))
+    from collections import Counter
+    level_counts = Counter(k for k, _ in per_note)
+    winning_notes = len(per_note)
+    cost = int(compound.get('cost', 28))
+    return {
+        'reds': sorted(reds),
+        'blues': sorted(blues),
+        'red_hits': red_hits,
+        'blue_hits': blue_hits,
+        'red_count': red_count,
+        'blue_count': blue_count,
+        'bonus': bonus,
+        'winning_notes': winning_notes,
+        'level_counts': dict(level_counts),
+        'cost': cost,
+        'net': bonus - cost,
+    }
+
+
 def build_review(draw, picks):
     shape = summarize_shape(draw)
     lines = []
@@ -202,125 +255,59 @@ def build_review(draw, picks):
     else:
         lines.append("连号：无")
 
-    main = picks.get('main', [])
-    backup = picks.get('backup', [])
-    consensus = picks.get('consensus_6x5', {})
-    consensus_notes = consensus.get('notes', [])
-    consensus_reds = consensus.get('reds', [])
+    compound = picks.get('compound_7x2')
 
-    # === V2 传统5注命中情况 ===
-    v2_lines = []
-    v2_prize = 0
-    v2_best = None
-    for kind, idx, ticket in [('主推', i + 1, t) for i, t in enumerate(main)] + [('备选', i + 1, t) for i, t in enumerate(backup)]:
-        cmp = compare_ticket(ticket, draw['reds'], draw['blue'])
-        score = (cmp['red_count'], 1 if cmp['blue_hit'] else 0)
-        if v2_best is None or score > v2_best[0]:
-            v2_best = (score, kind, idx, cmp)
-        v2_prize += cmp['prize_amount']
-        hit_text = f"{kind}{idx}：{cmp['red_count']}红"
-        if cmp['red_hits']:
-            hit_text += f"（{','.join(f'{n:02d}' for n in cmp['red_hits'])}）"
-        if cmp['blue_hit']:
-            hit_text += " + 蓝"
-        if cmp['prize_level']:
-            hit_text += f" → {cmp['prize_level']} {cmp['prize_amount']:,}元"
-        else:
-            hit_text += " → 未中奖 0元"
-        v2_lines.append(hit_text)
-
-    lines.append("")
-    lines.append("🎯 传统5注命中情况：")
-    lines.extend([f"• {x}" for x in v2_lines])
-
-    # === 共识6+5命中情况 ===
-    c65_total_prize = 0
-    c65_best = None
-    c65_lines = []
-    for n in consensus_notes:
-        cmp = compare_ticket(n, draw['reds'], draw['blue'])
-        score = (cmp['red_count'], 1 if cmp['blue_hit'] else 0)
-        if c65_best is None or score > c65_best[0]:
-            c65_best = (score, n['seq'], cmp)
-        c65_total_prize += cmp['prize_amount']
-        hit_text = f"注{n['seq']}：{cmp['red_count']}红"
-        if cmp['red_hits']:
-            hit_text += f"（{','.join(f'{n:02d}' for n in cmp['red_hits'])}）"
-        if cmp['blue_hit']:
-            hit_text += " + 蓝"
-        if cmp['prize_level']:
-            hit_text += f" → {cmp['prize_level']} {cmp['prize_amount']:,}元"
-        else:
-            hit_text += " → 未中奖 0元"
-        c65_lines.append(hit_text)
-
-    lines.append("")
-    lines.append("🏆 共识6+5选号命中情况：")
-    if consensus_reds:
-        lines.append(f"  红球：{' '.join(f'{n:02d}' for n in consensus_reds)}")
-    lines.extend([f"• {x}" for x in c65_lines])
-
-    # === 合计（默认只买6+5，10元） ===
-    actual_cost = 10  # 只买6+5，10元
-    actual_prize = c65_total_prize
-    actual_net = actual_prize - actual_cost
-    if v2_prize > 0:
-        v2_note = f"传统5注 ¥{v2_prize}（未买参考）"
+    if compound:
+        compound_summary = summarize_compound_7x2(compound, draw)
+        actual_cost = compound_summary['cost']
+        actual_prize = compound_summary['bonus']
+        actual_net = compound_summary['net']
+        primary_lines = [
+            "🎯 7+2复式命中情况：",
+            f"  红球：{' '.join(f'{n:02d}' for n in compound_summary['reds'])}",
+            f"  蓝球：{' '.join(f'{n:02d}' for n in compound_summary['blues'])}",
+            f"• 命中：{compound_summary['red_count']}红{('（' + '、'.join(f'{n:02d}' for n in compound_summary['red_hits']) + '）') if compound_summary['red_hits'] else ''} | 蓝{'全中' if compound_summary['blue_count'] == 2 else ('1中' if compound_summary['blue_count'] == 1 else '0中')}",
+            f"• 中奖注数：{compound_summary['winning_notes']} 注",
+            f"• 奖金：¥{compound_summary['bonus']:,}",
+            f"• 成本：¥{compound_summary['cost']}｜净{'盈' if compound_summary['net'] >= 0 else '亏'} ¥{abs(compound_summary['net']):,}",
+        ]
+        best_line = f"🏅 本期最佳：7+2复式，{compound_summary['red_count']}红 + {'2蓝' if compound_summary['blue_count'] == 2 else ('1蓝' if compound_summary['blue_count'] == 1 else '无蓝')}"
+        actual_cost = compound_summary['cost']
+        actual_prize = compound_summary['bonus']
+        actual_net = compound_summary['net']
     else:
-        v2_note = f"传统5注 ¥{v2_prize}"
+        actual_cost = 0
+        actual_prize = 0
+        actual_net = 0
+        primary_lines = ["🎯 未找到可用复盘目标。"]
+        best_line = None
+
+    lines.extend(primary_lines)
     lines.append("")
-    lines.append(f"💰 本期汇总：{v2_note}｜6+5 ¥{c65_total_prize}｜实付 ¥{actual_cost}｜净{'盈' if actual_net >= 0 else '亏'} ¥{abs(actual_net)}")
+    lines.append(f"💰 本期汇总：实付 ¥{actual_cost}｜奖金 ¥{actual_prize:,}｜净{'盈' if actual_net >= 0 else '亏'} ¥{abs(actual_net):,}")
+    if best_line:
+        lines.append(best_line)
 
-    # 最佳表现
-    all_best = None
-    if v2_best and c65_best:
-        if v2_best[0] >= c65_best[0]:
-            all_best = ('传统5注', v2_best)
-        else:
-            all_best = ('共识6+5', c65_best)
-    elif v2_best:
-        all_best = ('传统5注', v2_best)
-    elif c65_best:
-        all_best = ('共识6+5', c65_best)
-    
-    if all_best:
-        bc = all_best[1][3]
-        lines.append(f"🏅 本期最佳：{all_best[0]}{all_best[1][2]}，{bc['red_count']}红{' + 蓝' if bc['blue_hit'] else ''}")
-
-    # 奖金信息（2026-04-09 固化）
-    # 优先从历史文件/API 获取，如果没有则检查手动录入
     prize_info = get_prize_info(draw['draw_id'])
-    
-    # 手动录入入口（可选）：在 picks 文件里找 bonus_manual 字段
     if not prize_info and picks:
         manual_bonus = picks.get('bonus_manual', {})
         if manual_bonus:
             prize_info = {}
-            if 'prize_1' in manual_bonus:
-                prize_info['prize_1'] = {
-                    'count': int(manual_bonus['prize_1'].get('count', 0)),
-                    'amount': float(manual_bonus['prize_1'].get('amount', 0))
-                }
-            if 'prize_2' in manual_bonus:
-                prize_info['prize_2'] = {
-                    'count': int(manual_bonus['prize_2'].get('count', 0)),
-                    'amount': float(manual_bonus['prize_2'].get('amount', 0))
-                }
-    
+            for key in ('prize_1', 'prize_2'):
+                if key in manual_bonus:
+                    prize_info[key] = {
+                        'count': int(manual_bonus[key].get('count', 0)),
+                        'amount': float(manual_bonus[key].get('amount', 0)),
+                    }
+
     if prize_info:
         lines.append("")
         lines.append("💰 本期奖金：")
-        if 'prize_1' in prize_info:
-            p1 = prize_info['prize_1']
-            lines.append(f"- 一等奖：{p1['count']} 注，单注 {int(p1['amount']):,} 元")
-        if 'prize_2' in prize_info:
-            p2 = prize_info['prize_2']
-            lines.append(f"- 二等奖：{p2['count']} 注，单注 {int(p2['amount']):,} 元")
-        if 'prize_3' in prize_info:
-            p3 = prize_info['prize_3']
-            lines.append(f"- 三等奖：{p3['count']} 注，单注 {int(p3['amount']):,} 元")
+        for key in ('prize_1', 'prize_2', 'prize_3'):
+            if key in prize_info:
+                p = prize_info[key]
+                lines.append(f"- {key.replace('_', ' ')}：{p['count']} 注，单注 {int(p['amount']):,} 元")
 
-    # 简短规则复盘
     review = []
     if shape['sum'] < 90:
         review.append("和值偏低，后续可略提高低和值组合权重。")
@@ -341,7 +328,7 @@ def build_review(draw, picks):
 
     lines.append("")
     lines.append("🧪 规则净化建议：")
-    lines.extend([f"- {x}" for x in review])
+    lines.extend(f"- {x}" for x in review)
     lines.append("")
     lines.append("结论：继续做纪律化复盘，优化规则，但不做'必中'幻想。")
     return '\n'.join(lines)
