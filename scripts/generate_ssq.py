@@ -1019,6 +1019,9 @@ def generate_7x2_compound(candidates, config, history):
             omit += 1
         blue_omit[b] = omit
 
+    # 兜底初始化：任何策略下保证 blue_scores 可用（旧策略填充，新策略留空）
+    blue_scores = {}
+
     if blue_strategy == 'hot_top2':
         # 热号+次热号：按综合频率（近期×3+中期×2+远期×1）排序取Top2
         ranked_blues = sorted(range(1, 17), key=lambda b: (-blue_freq.get(b, 0), b))
@@ -1038,7 +1041,6 @@ def generate_7x2_compound(candidates, config, history):
         blue2 = sorted({cold_blue, warm_blue})
     else:
         # 旧策略：高频1 + 遗漏Top1（纯冷追）
-        blue_scores = {}
         for c in top_candidates:
             b = c['blue']
             if b not in blue_scores or c['score'] > blue_scores[b]:
