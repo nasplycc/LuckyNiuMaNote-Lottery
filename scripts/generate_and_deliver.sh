@@ -17,7 +17,7 @@ try=0
 period="$(date +%m.%d)"
 until [ $try -ge $MAX ]; do
   try=$((try+1))
-  if openclaw message send --channel telegram --target 8594152561 \
+  if openclaw message send --channel telegram --account telegram-finnace --target 8594152561 \
       -m "🎯 双色球 ${period} 期选号（第 ${try} 次尝试）\n${OUT}" >/dev/null 2>&1; then
     echo "✅ 选号已推送（第 ${try} 次尝试成功）"
     exit 0
