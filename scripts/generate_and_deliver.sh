@@ -4,10 +4,21 @@
 set -u
 cd /vol1/1000/code/lottery-ssq
 
-# 定位 openclaw：优先绝对路径，回退 PATH
-OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || true)"
-if [ -z "$OPENCLAW_BIN" ] && [ -x /home/Jaben/.nvm/versions/node/v24.20.0/bin/openclaw ]; then
-  OPENCLAW_BIN=/home/Jaben/.nvm/versions/node/v24.20.0/bin/openclaw
+# 定位 openclaw：优先 nvm 稳定安装路径（真正的 openclaw CLI）。
+# 不能用 command -v 的 PATH 结果：cron isolated 环境里 PATH 会命中
+# /home/Jaben/.openclaw/tmp/agent-cli/openclaw（临时 wrapper），该路径在 cron 内
+# 无法接入 gateway 会话上下文，导致推送静默失败（26130 实测 error×3）。
+OPENCLAW_BIN=""
+for c in /home/Jaben/.nvm/versions/node/v24.20.0/bin/openclaw \
+         /usr/local/bin/openclaw \
+         /usr/bin/openclaw; do
+  if [ -x "$c" ]; then
+    OPENCLAW_BIN="$c"
+    break
+  fi
+done
+if [ -z "$OPENCLAW_BIN" ]; then
+  OPENCLAW_BIN="$(command -v openclaw 2>/dev/null || true)"
 fi
 if [ -z "$OPENCLAW_BIN" ]; then
   echo "❌ openclaw 命令未找到（PATH=$PATH）"
